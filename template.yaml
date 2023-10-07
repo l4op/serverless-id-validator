@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SERVERLESS ID VALIDATOR
+
+  Serverless microservice validates an User from a selfie and an ID document
+
+Globals:
+  Function:
+    Timeout: 20
+    Runtime: java17
+    Architectures:
+      - arm64
+    MemorySize: 512
+    Environment:
+      Variables:
+        JAVA_TOOL_OPTIONS:  -XX:+TieredCompilation -XX:TieredStopAtLevel=1
+
+Resources:
+
+  #API Gateway created using SAM simple declaration
+  ServerlessIdValidatorAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+      Name: serverless-id-validator
+      Auth:
+        ApiKeyRequired: true
+
+  #Attaching an usage plan to protect the API and count the usage
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      ApiStages:
+        - ApiId: !Ref ServerlessIdValidatorAPI
+          Stage: !Ref ServerlessIdValidatorAPI.Stage
+      Description: Usage plan for this API
+      Quota:
+        Limit: 100
+        Period: MONTH
+      Throttle:
+        BurstLimit: 10
+        RateLimit: 10
+      Tags:
+        - Key: usage-plan
+          Value: serverless-id-validator
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Enabled: True
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ServerlessIdValidatorAPI
+
+  #Lambda function
+  InitializeLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: it.loooop.Initialize::handleRequest
+      CodeUri: .
+      Environment:
+        Variables:
+          DYNAMODB_IDENTIFICATIONS_TABLE: !Ref IdentificationsTable
+          DYNAMODB_CLIENTS_TABLE: !Ref ClientsTable
+          S3_PRESIGNED: !Ref IdBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IdentificationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClientsTable
+        - S3FullAccessPolicy:
+            BucketName: !Ref IdBucket
+
+      Events:
+        ApiEvents:
+          Type: Api
+          Properties:
+            Path: /identification
+            Method: PUT
+            RestApiId: !Ref ServerlessIdValidatorAPI
+
+  GetIdentificationLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: it.loooop.GetIdentification::handleRequest
+      CodeUri: .
+      Environment:
+        Variables:
+          DYNAMODB_IDENTIFICATIONS_TABLE: !Ref IdentificationsTable
+          DYNAMODB_CLIENTS_TABLE: !Ref ClientsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IdentificationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClientsTable
+      Events:
+        ApiEvents:
+          Type: Api
+          Properties:
+            Path: /identification
+            Method: POST
+            RestApiId: !Ref ServerlessIdValidatorAPI
+
+  #Table with Customers informations
+  ClientsTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: Customers
+      PrimaryKey:
+        Name: clientId
+        Type: String
+
+  #Table with identification requests
+  IdentificationsTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: Identifications
+      PrimaryKey:
+        Name: identificationId
+        Type: String
+
+  #S3 for uploading id document
+  IdBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - "*"
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  #S3 for uploading selfie
+  SelfieBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - "*"
+
+
+
+  # Creates a Step Functions workflow.
+  IdentificatorStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      # The statemachine.asl.json file contains a sample workflow definition.
+      DefinitionUri: statemachine/statemachine.asl.json
+      DefinitionSubstitutions:
+        IdentitySelfieBucket: !Ref SelfieBucket
+      Policies:
+        - RekognitionFacesPolicy: {}
+        - RekognitionLabelsPolicy: {}
+        - TextractPolicy: {}
+        - S3ReadPolicy:
+            BucketName: !Ref IdBucket
+        - S3ReadPolicy:
+            BucketName: !Ref SelfieBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IdentificationsTable
+      # The Step Functions workflow is triggered each time an object is created in our S3 bucket.
+      Events:
+        StateChange:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: default
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref IdBucket
+
+Outputs:
+  API:
+    Description: API Endpoint
+    Value: !Sub "https://${ServerlessIdValidatorAPI}.execute-api.${AWS::Region}.amazonaws.com/dev"

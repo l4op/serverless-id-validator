@@ -1,0 +1,228 @@
+{
+  "Comment": "Identification State Machine",
+  "StartAt": "Detect document type",
+  "States": {
+    "Detect document type": {
+      "Type": "Task",
+      "Parameters": {
+        "Image": {
+          "S3Object": {
+            "Bucket.$": "$.detail.bucket.name",
+            "Name.$": "$.detail.object.key"
+          }
+        }
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rekognition:detectLabels",
+      "Next": "Handle list output",
+      "ResultPath": "$.detectedLabels"
+    },
+    "Handle list output": {
+      "Type": "Map",
+      "Iterator": {
+        "StartAt": "Pass",
+        "States": {
+          "Pass": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      },
+      "ResultSelector": {
+        "Labels.$": "$[?(@.Name == 'Id Cards')]"
+      },
+      "ResultPath": "$.ProcessResult",
+      "Next": "Is the document an Id Card?",
+      "ItemsPath": "$.detectedLabels.Labels"
+    },
+    "Is the document an Id Card?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.ProcessResult.Labels[0]",
+          "IsPresent": true,
+          "Next": "Document type Id Card"
+        }
+      ],
+      "Default": "Identification failed: not an Id Card"
+    },
+    "Identification failed: not an Id Card": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "Identifications",
+        "Key": {
+          "identificationId": {
+            "S.$": "$.detail.object.key"
+          }
+        },
+        "UpdateExpression": "SET #status = :newStatus, description = :description",
+        "ExpressionAttributeValues": {
+          ":newStatus": {
+            "S": "FAILED"
+          },
+          ":description": {
+            "S": "Not an Id Card"
+          }
+        },
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        }
+      },
+      "Next": "Not valid"
+    },
+    "Document type Id Card": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "Identifications",
+        "Key": {
+          "identificationId": {
+            "S.$": "$.detail.object.key"
+          }
+        },
+        "UpdateExpression": "SET #status = :newStatus",
+        "ExpressionAttributeValues": {
+          ":newStatus": {
+            "S": "IS_ID_CARD"
+          }
+        },
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        }
+      },
+      "Next": "CompareFaces",
+      "ResultPath": null
+    },
+    "CompareFaces": {
+      "Type": "Task",
+      "Next": "Is face on Selfie matching the one on the Id Card?",
+      "Parameters": {
+        "SourceImage": {
+          "S3Object": {
+            "Bucket.$": "$.detail.bucket.name",
+            "Name.$": "$.detail.object.key"
+          }
+        },
+        "TargetImage": {
+          "S3Object": {
+            "Bucket": "${IdentitySelfieBucket}",
+            "Name.$": "$.detail.object.key"
+          }
+        }
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rekognition:compareFaces",
+      "ResultPath": "$.comparedFaces"
+    },
+    "Is face on Selfie matching the one on the Id Card?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.comparedFaces.FaceMatches[0].Face.Confidence",
+              "NumericGreaterThan": 95
+            },
+            {
+              "Variable": "$.comparedFaces.FaceMatches[0].Similarity",
+              "NumericGreaterThan": 95
+            }
+          ],
+          "Next": "Face on Selfie and Id Card matches"
+        }
+      ],
+      "Default": "Identification failed: face mismatch"
+    },
+    "Face on Selfie and Id Card matches": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "Identifications",
+        "Key": {
+          "identificationId": {
+            "S.$": "$.detail.object.key"
+          }
+        },
+        "UpdateExpression": "SET #status = :newStatus",
+        "ExpressionAttributeValues": {
+          ":newStatus": {
+            "S": "FACE_MATCHES"
+          }
+        },
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        }
+      },
+      "ResultPath": null,
+      "Next": "AnalyzeID"
+    },
+    "AnalyzeID": {
+      "Type": "Task",
+      "Parameters": {
+        "DocumentPages": [
+          {
+            "S3Object": {
+              "Bucket.$": "$.detail.bucket.name",
+              "Name.$": "$.detail.object.key"
+            }
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::aws-sdk:textract:analyzeID",
+      "Next": "Save extracted data",
+      "ResultPath": "$.analyzedId"
+    },
+    "Save extracted data": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "Identifications",
+        "Key": {
+          "identificationId": {
+            "S.$": "$.detail.object.key"
+          }
+        },
+        "UpdateExpression": "SET documentData = :analyzedId",
+        "ExpressionAttributeValues": {
+          ":analyzedId": {
+            "S.$": "States.JsonToString($.analyzedId.IdentityDocuments[0].IdentityDocumentFields)"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "Valid"
+    },
+    "Valid": {
+      "Type": "Pass",
+      "End": true
+    },
+    "Not valid": {
+      "Type": "Pass",
+      "End": true
+    },
+    "Identification failed: face mismatch": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "Identifications",
+        "Key": {
+          "identificationId": {
+            "S.$": "$.detail.object.key"
+          }
+        },
+        "UpdateExpression": "SET #status = :newStatus, description = :description",
+        "ExpressionAttributeValues": {
+          ":newStatus": {
+            "S": "FAILED"
+          },
+          ":description": {
+            "S": "Face mismatch"
+          }
+        },
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        }
+      },
+      "Next": "Not valid"
+    }
+  }
+}
